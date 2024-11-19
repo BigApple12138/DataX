@@ -9,7 +9,6 @@
     <modelVersion>4.0.0</modelVersion>
 
     <artifactId>hdfsreader</artifactId>
-    <groupId>com.alibaba.datax</groupId>
     <version>0.0.1-SNAPSHOT</version>
     <packaging>jar</packaging>
     <properties>
@@ -130,7 +129,7 @@
         <dependency>
             <groupId>org.apache.parquet</groupId>
             <artifactId>parquet-format</artifactId>
-            <version>2.3.0</version>
+            <version>2.3.1</version>
         </dependency>
         <dependency>
             <groupId>org.apache.parquet</groupId>
