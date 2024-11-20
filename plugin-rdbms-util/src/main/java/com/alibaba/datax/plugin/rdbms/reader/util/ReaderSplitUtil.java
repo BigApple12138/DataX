@@ -14,12 +14,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class ReaderSplitUtil {
-    private static final Logger LOG = LoggerFactory
-            .getLogger(ReaderSplitUtil.class);
+    private static final Logger LOG = LoggerFactory.getLogger(ReaderSplitUtil.class);
 
-    public static List<Configuration> doSplit(
-            Configuration originalSliceConfig, int adviceNumber) {
-        boolean isTableMode = originalSliceConfig.getBool(Constant.IS_TABLE_MODE).booleanValue();
+    public static List<Configuration> doSplit(Configuration originalSliceConfig, int adviceNumber) {
+        boolean isTableMode = originalSliceConfig.getBool(Constant.IS_TABLE_MODE);
         int eachTableShouldSplittedNumber = -1;
         if (isTableMode) {
             // adviceNumber这里是channel数量大小, 即datax并发task数量
@@ -30,10 +28,12 @@ public final class ReaderSplitUtil {
 
         String column = originalSliceConfig.getString(Key.COLUMN);
         String where = originalSliceConfig.getString(Key.WHERE, null);
+        String splitPk = originalSliceConfig.getString(Key.SPLIT_PK, null);
+        List<String> splitWhereConditions = originalSliceConfig.getList(Key.SPLIT_WHERE, String.class);
 
         List<Object> conns = originalSliceConfig.getList(Constant.CONN_MARK, Object.class);
 
-        List<Configuration> splittedConfigs = new ArrayList<Configuration>();
+        List<Configuration> splittedConfigs = new ArrayList<>();
 
         for (int i = 0, len = conns.size(); i < len; i++) {
             Configuration sliceConfig = originalSliceConfig.clone();
@@ -56,12 +56,10 @@ public final class ReaderSplitUtil {
 
                 Validate.isTrue(null != tables && !tables.isEmpty(), "您读取数据库表配置错误.");
 
-                String splitPk = originalSliceConfig.getString(Key.SPLIT_PK, null);
+                boolean useSplitPk = StringUtils.isNotBlank(splitPk);
+                boolean useSplitWhere = splitWhereConditions != null && !splitWhereConditions.isEmpty() && StringUtils.isBlank(splitPk);
 
-                //最终切分份数不一定等于 eachTableShouldSplittedNumber
-                boolean needSplitTable = eachTableShouldSplittedNumber > 1
-                        && StringUtils.isNotBlank(splitPk);
-                if (needSplitTable) {
+                if (useSplitPk) {
                     if (tables.size() == 1) {
                         //原来:如果是单表的，主键切分num=num*2+1
                         // splitPk is null这类的情况的数据量本身就比真实数据量少很多, 和channel大小比率关系时，不建议考虑
@@ -82,30 +80,43 @@ public final class ReaderSplitUtil {
 
                         List<Configuration> splittedSlices = SingleTableSplitUtil
                                 .splitSingleTable(tempSlice, eachTableShouldSplittedNumber);
-
+                        // 每个表的切分，都是一个独立的配置
                         splittedConfigs.addAll(splittedSlices);
+                    }
+                } else if (useSplitWhere) {
+                    for (String table : tables) {
+                        for (String splitWhere : splitWhereConditions) {
+                            tempSlice = sliceConfig.clone();
+                            tempSlice.set(Key.TABLE, table);
+                            String queryColumn = HintUtil.buildQueryColumn(jdbcUrl, table, column);
+                            String querySql = buildQuerySqlWithWhere(queryColumn, table, where, splitWhere);
+                            tempSlice.set(Key.QUERY_SQL, querySql);
+                            LOG.info("Generated query SQL: {}", querySql);
+                            splittedConfigs.add(tempSlice);
+                        }
                     }
                 } else {
                     for (String table : tables) {
                         tempSlice = sliceConfig.clone();
                         tempSlice.set(Key.TABLE, table);
                         String queryColumn = HintUtil.buildQueryColumn(jdbcUrl, table, column);
-                        tempSlice.set(Key.QUERY_SQL, SingleTableSplitUtil.buildQuerySql(queryColumn, table, where));
+                        String querySql = buildQuerySqlWithWhere(queryColumn, table, where, null);
+                        tempSlice.set(Key.QUERY_SQL, querySql);
+                        LOG.info("Generated query SQL: {}", querySql);
                         splittedConfigs.add(tempSlice);
                     }
                 }
             } else {
                 // 说明是配置的 querySql 方式
                 List<String> sqls = connConf.getList(Key.QUERY_SQL, String.class);
-
                 // TODO 是否check 配置为多条语句？？
                 for (String querySql : sqls) {
                     tempSlice = sliceConfig.clone();
                     tempSlice.set(Key.QUERY_SQL, querySql);
+                    LOG.info("Generated query SQL: {}", querySql);
                     splittedConfigs.add(tempSlice);
                 }
             }
-
         }
 
         return splittedConfigs;
@@ -113,54 +124,77 @@ public final class ReaderSplitUtil {
 
     public static Configuration doPreCheckSplit(Configuration originalSliceConfig) {
         Configuration queryConfig = originalSliceConfig.clone();
-        boolean isTableMode = originalSliceConfig.getBool(Constant.IS_TABLE_MODE).booleanValue();
-
-        String splitPK = originalSliceConfig.getString(Key.SPLIT_PK);
+        boolean isTableMode = originalSliceConfig.getBool(Constant.IS_TABLE_MODE);
+        String splitPk = originalSliceConfig.getString(Key.SPLIT_PK, null);
         String column = originalSliceConfig.getString(Key.COLUMN);
         String where = originalSliceConfig.getString(Key.WHERE, null);
 
+        List<String> splitWhereConditions = originalSliceConfig.getList(Key.SPLIT_WHERE, String.class);
+
         List<Object> conns = queryConfig.getList(Constant.CONN_MARK, Object.class);
 
-        for (int i = 0, len = conns.size(); i < len; i++){
+        for (int i = 0, len = conns.size(); i < len; i++) {
             Configuration connConf = Configuration.from(conns.get(i).toString());
-            List<String> querys = new ArrayList<String>();
-            List<String> splitPkQuerys = new ArrayList<String>();
-            String connPath = String.format("connection[%d]",i);
-            // 说明是配置的 table 方式
+            List<String> querys = new ArrayList<>();
+            List<String> splitPkQuerys = new ArrayList<>();
+
             if (isTableMode) {
                 // 已在之前进行了扩展和`处理，可以直接使用
                 List<String> tables = connConf.getList(Key.TABLE, String.class);
                 Validate.isTrue(null != tables && !tables.isEmpty(), "您读取数据库表配置错误.");
+
+                boolean useSplitPk = StringUtils.isNotBlank(splitPk);
+                boolean useSplitWhere = splitWhereConditions != null && !splitWhereConditions.isEmpty() && StringUtils.isBlank(splitPk);
+
                 for (String table : tables) {
-                    querys.add(SingleTableSplitUtil.buildQuerySql(column,table,where));
-                    if (splitPK != null && !splitPK.isEmpty()){
-                        splitPkQuerys.add(SingleTableSplitUtil.genPKSql(splitPK.trim(),table,where));
+                    if (useSplitPk) {
+                        splitPkQuerys.add(SingleTableSplitUtil.genPKSql(splitPk.trim(), table, where));
+                    } else if (useSplitWhere) {
+                        for (String splitWhere : splitWhereConditions) {
+                            String querySql = buildQuerySqlWithWhere(column, table, where, splitWhere);
+                            querys.add(querySql);
+                            LOG.info("Generated query SQL: {}", querySql);
+                        }
+                    } else {
+                        String querySql = buildQuerySqlWithWhere(column, table, where, null);
+                        querys.add(querySql);
+                        LOG.info("Generated query SQL: {}", querySql);
                     }
                 }
-                if (!splitPkQuerys.isEmpty()){
-                    connConf.set(Key.SPLIT_PK_SQL,splitPkQuerys);
+                if (!splitPkQuerys.isEmpty()) {
+                    connConf.set(Key.SPLIT_PK_SQL, splitPkQuerys);
                 }
-                connConf.set(Key.QUERY_SQL,querys);
-                queryConfig.set(connPath,connConf);
+                connConf.set(Key.QUERY_SQL, querys);
+                queryConfig.set(String.format("connection[%d]", i), connConf);
             } else {
-                // 说明是配置的 querySql 方式
-                List<String> sqls = connConf.getList(Key.QUERY_SQL,
-                        String.class);
-                for (String querySql : sqls) {
-                    querys.add(querySql);
-                }
-                connConf.set(Key.QUERY_SQL,querys);
-                queryConfig.set(connPath,connConf);
+                List<String> sqls = connConf.getList(Key.QUERY_SQL, String.class);
+                querys.addAll(sqls);
+                connConf.set(Key.QUERY_SQL, querys);
+                queryConfig.set(String.format("connection[%d]", i), connConf);
             }
         }
         return queryConfig;
     }
 
-    private static int calculateEachTableShouldSplittedNumber(int adviceNumber,
-                                                              int tableNumber) {
+    private static int calculateEachTableShouldSplittedNumber(int adviceNumber, int tableNumber) {
         double tempNum = 1.0 * adviceNumber / tableNumber;
 
         return (int) Math.ceil(tempNum);
     }
 
+    private static String buildQuerySqlWithWhere(String columns, String table, String where, String additionalWhere) {
+        StringBuilder sb = new StringBuilder("SELECT ");
+        sb.append(columns).append(" FROM ").append(table);
+        if (StringUtils.isNotBlank(where)) {
+            sb.append(" WHERE ").append(where);
+        }
+        if (StringUtils.isNotBlank(additionalWhere)) {
+            if (sb.toString().contains("WHERE")) {
+                sb.append(" AND ").append(additionalWhere);
+            } else {
+                sb.append(" WHERE ").append(additionalWhere);
+            }
+        }
+        return sb.toString();
+    }
 }

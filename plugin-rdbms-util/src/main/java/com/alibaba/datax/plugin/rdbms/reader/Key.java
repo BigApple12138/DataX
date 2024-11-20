@@ -46,7 +46,9 @@ public final class Key {
 
     public final static String DRYRUN = "dryRun";
 
-    public static String SPLIT_FACTOR = "splitFactor";
+    public final static String SPLIT_WHERE = "splitWhere";
+
+    public final static String SPLIT_FACTOR = "splitFactor";
 
     public final static String WEAK_READ = "weakRead";
 
